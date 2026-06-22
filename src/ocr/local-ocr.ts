@@ -32,10 +32,8 @@ import os from 'os';
 // ── 类型定义 ──────────────────────────────────
 
 interface OCRConfig {
-  ocrBackend: string;
   onnxModelPath: string;
   onnxOcrModelPath: string;
-  ocrServiceUrl: string;
   ocrServerPort: number;
   ocrServerHost: string;
 }

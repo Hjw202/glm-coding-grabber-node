@@ -13,13 +13,6 @@ interface ConvictProperty {
 
 const defaultConfig: Record<string, ConvictProperty> = {
   // ── OCR 设置 ──────────────────────────────────
-  ocrBackend: {
-    doc: 'OCR 后端: local / python',
-    format: 'string',
-    default: 'local',
-    env: 'OCR_BACKEND',
-    validator: (val) => ['local', 'python'].includes(val as string),
-  },
   onnxModelPath: {
     doc: 'ONNX 检测模型路径（ddddocr common_det.onnx）',
     format: 'string',
@@ -31,12 +24,6 @@ const defaultConfig: Record<string, ConvictProperty> = {
     format: 'string',
     default: '',
     env: 'ONNX_OCR_MODEL_PATH',
-  },
-  ocrServiceUrl: {
-    doc: 'Python OCR 服务地址（fallback）',
-    format: 'string',
-    default: 'http://127.0.0.1:9898',
-    env: 'OCR_SERVICE_URL',
   },
 
   // ── OCR HTTP 服务 ────────────────────────────

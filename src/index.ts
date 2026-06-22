@@ -21,10 +21,8 @@ import cors from "cors";
 import { LocalOCREngine } from "./ocr/local-ocr.js";
 
 interface OCRConfig {
-  ocrBackend: string;
   onnxModelPath: string;
   onnxOcrModelPath: string;
-  ocrServiceUrl: string;
   ocrServerPort: number;
   ocrServerHost: string;
 }
