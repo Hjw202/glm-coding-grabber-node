@@ -1,0 +1,11 @@
+node_modules/
+logs/
+dist/
+*.log
+.DS_Store
+._*
+Thumbs.db
+.vscode
+
+# 大文件（模型、训练数据等）
+data/
