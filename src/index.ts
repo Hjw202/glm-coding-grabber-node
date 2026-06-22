@@ -10,6 +10,11 @@
  * 4. 错误处理中间件统一捕获异常
  */
 
+// 必须在所有模块加载前设置 UV_THREADPOOL_SIZE
+// sharp + onnxruntime 并发操作需要更多线程，默认 4 个会导致严重瓶颈
+// 设置为 12 可同时处理 4-6 个 crop+OCR 并发操作
+process.env.UV_THREADPOOL_SIZE = '12';
+
 import config from "../config/index.js";
 import express, { type Request, type Response } from "express";
 import cors from "cors";

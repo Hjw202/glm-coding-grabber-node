@@ -157,14 +157,16 @@ export class ONNXOCRClassifier {
    * 分类单个图像区域（增强版，返回文字 + 置信度 + top-k 候选）
    *
    * @param imgBuffer - 图像 Buffer (PNG/JPEG)
+   * @param knownWidth - 已知宽度（可选，避免重复 metadata 调用）
+   * @param knownHeight - 已知高度（可选，避免重复 metadata 调用）
    * @returns text: CTC 解码后的文字
    *         confidence: sigmoid(max_margin) 平均置信度 [0,1]
    *         topKChars: 每个解码位置 top-K 候选字符集合
    */
-  async classifyWithConfidence(imgBuffer: Buffer): Promise<ClassifyWithConfidenceResult> {
+  async classifyWithConfidence(imgBuffer: Buffer, knownWidth?: number, knownHeight?: number): Promise<ClassifyWithConfidenceResult> {
     await this.init();
 
-    const inputTensor = await this._preprocess(imgBuffer);
+    const inputTensor = await this._preprocess(imgBuffer, knownWidth, knownHeight);
 
     const inputName = this.session!.inputNames[0];
     const feeds: Record<string, ort.Tensor> = { [inputName]: inputTensor };
@@ -177,13 +179,32 @@ export class ONNXOCRClassifier {
 
   /**
    * 预处理（与 ddddocr OCREngine 一致）
+   * 优化：接受已知尺寸避免 metadata 调用
    */
-  private async _preprocess(imgBuffer: Buffer): Promise<ort.Tensor> {
+  private async _preprocess(imgBuffer: Buffer, knownWidth?: number, knownHeight?: number): Promise<ort.Tensor> {
+    const targetH = 64;
+
+    // 如果已知尺寸，直接计算 targetW，避免 metadata 调用
+    if (knownWidth && knownHeight) {
+      const targetW = Math.max(1, Math.round(knownWidth * (targetH / knownHeight)));
+      const resized = await sharp(imgBuffer)
+        .resize(targetW, targetH, { fit: 'fill' })
+        .grayscale()
+        .raw()
+        .toBuffer();
+
+      const floatData = new Float32Array(1 * 1 * targetH * targetW);
+      for (let i = 0; i < resized.length; i++) {
+        floatData[i] = resized[i] / 255.0;
+      }
+
+      return new ort.Tensor('float32', floatData, [1, 1, targetH, targetW]);
+    }
+
+    // fallback: 需要获取图像尺寸，先 metadata 再 resize（两个 sharp 调用）
     const meta = await sharp(imgBuffer).metadata();
     const origW = meta.width || 64;
     const origH = meta.height || 64;
-
-    const targetH = 64;
     const targetW = Math.max(1, Math.round(origW * (targetH / origH)));
 
     const resized = await sharp(imgBuffer)

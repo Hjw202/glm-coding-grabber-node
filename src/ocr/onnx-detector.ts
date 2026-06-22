@@ -91,15 +91,19 @@ export class ONNXDetectionEngine {
   /**
    * 检测图像中的目标区域
    * @param imgBuffer - 原始图像 Buffer (PNG/JPEG)
+   * @param imgW - 原始图像宽度（可选，避免重复 metadata 调用）
+   * @param imgH - 原始图像高度（可选，避免重复 metadata 调用）
    * @returns 检测到的区域列表
    */
-  async detect(imgBuffer: Buffer): Promise<DetectionResult[]> {
+  async detect(imgBuffer: Buffer, imgW?: number, imgH?: number): Promise<DetectionResult[]> {
     await this.init();
 
-    // Step 1: 解码图像 + 获取尺寸
-    const meta = await sharp(imgBuffer).metadata();
-    const imgW = meta.width || 340;
-    const imgH = meta.height || 195;
+    // 使用传入尺寸或 fallback 到 sharp metadata
+    if (!imgW || !imgH) {
+      const meta = await sharp(imgBuffer).metadata();
+      imgW = meta.width || 340;
+      imgH = meta.height || 195;
+    }
 
     // Step 2: 预处理 (letterbox resize + padding)
     const { inputTensor, ratio } = await this._preprocess(imgBuffer, imgW, imgH);

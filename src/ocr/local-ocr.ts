@@ -78,6 +78,12 @@ interface OCRResult {
   score: number;
 }
 
+interface CropResult {
+  buffer: Buffer;
+  width: number;
+  height: number;
+}
+
 interface FastPathMapping {
   promptIdx: number;
   detectedIdx: number;
@@ -184,7 +190,7 @@ export class LocalOCREngine {
     const imgH = imgMeta.height || 195;
     const minDist = Math.min(imgW, imgH) * 0.10;
 
-    // Step 1: 检测目标区域（只返回边界框）
+    // Step 1: 检测目标区域（只返回边界框，传递已知尺寸避免重复 metadata）
     const t1 = Date.now();
     const detectedBoxes = await this._detectRegions(imgBuffer, promptText, imgW, imgH);
     console.log(`[OCR-耗时] Step1 检测区域: ${Date.now() - t1}ms`);
@@ -195,29 +201,40 @@ export class LocalOCREngine {
 
     console.log(`[OCR] 检测到 ${detectedBoxes.length} 个目标区域`);
 
-    // Step 2: 单次 crop + OCR（含 softmax 置信度 + top-k 候选）
-    const t2 = Date.now();
-    const detected: DetectedItem[] = await Promise.all(detectedBoxes.map(async (region) => {
-      const cropBuffer = await this._cropRegion(imgBuffer, region.box, imgW, imgH);
-      const { char, confidence, allResults, onnxConfidence } = await this._ocrEnsemble(cropBuffer);
-      return {
-        char,
-        confidence,
-        allOcr: allResults,
-        onnxConfidence,
-        x: (region.box[0] + region.box[2]) / 2,
-        y: (region.box[1] + region.box[3]) / 2,
-        cropBuffer,
-      };
+    // Step 2a: 先并行裁剪所有区域（减轻线程池争用）
+    const t2a = Date.now();
+    const cropResults = await Promise.all(detectedBoxes.map(async (region) => {
+      const { buffer, width, height } = await this._cropRegion(imgBuffer, region.box, imgW, imgH);
+      return { buffer, width, height, box: region.box };
     }));
-    console.log(`[OCR-耗时] Step2 crop+OCR: ${Date.now() - t2}ms`);
+    console.log(`[OCR-耗时] Step2a 裁剪区域 (并发): ${Date.now() - t2a}ms`);
+
+    // Step 2b: 并行 OCR 所有裁剪区域（sharp预处理 + ONNX推理）
+    const t2b = Date.now();
+    const ocrResults = await Promise.all(cropResults.map(async (crop) => {
+      return await this._ocrEnsemble(crop.buffer, crop.width, crop.height);
+    }));
+    console.log(`[OCR-耗时] Step2b OCR分类 (并发): ${Date.now() - t2b}ms`);
+
+    const detected: DetectedItem[] = cropResults.map((crop, i) => ({
+      char: ocrResults[i].char,
+      confidence: ocrResults[i].confidence,
+      allOcr: ocrResults[i].allResults,
+      onnxConfidence: ocrResults[i].onnxConfidence,
+      x: (crop.box[0] + crop.box[2]) / 2,
+      y: (crop.box[1] + crop.box[3]) / 2,
+      cropBuffer: crop.buffer,
+    }));
+    console.log(`[OCR-耗时] Step2 裁剪+OCR 总耗时: ${Date.now() - t2a}ms`);
 
     const ocrSummary = detected.map(d => `${d.char}(${((d.onnxConfidence ?? d.confidence) * 100).toFixed(0)}%)`).join(', ');
     console.log(`[OCR] OCR结果: ${ocrSummary}, 提示: [${promptText}]`);
 
     // Step 3: 快速路径 — ONNX OCR 高置信唯一匹配 → 跳过 HOG + 字体渲染
+    const t3 = Date.now();
     const fastPath = this._tryFastPath(detected, promptText);
     if (fastPath) {
+      console.log(`[OCR-耗时] 快速路径判断: ${Date.now() - t3}ms (命中快速路径)`);
       console.log(`[OCR-耗时] 快速路径总耗时: ${Date.now() - t0}ms`);
       console.log('[OCR] 快速路径: ONNX OCR 高置信直接匹配，跳过 HOG + 字体渲染');
       return fastPath.map(({ promptIdx, detectedIdx }) => ({
@@ -227,6 +244,11 @@ export class LocalOCREngine {
         matchChar: detected[detectedIdx].char,
         score: detected[detectedIdx].onnxConfidence ?? 1.0,
       }));
+    }
+    console.log(`[OCR-耗时] 快速路径判断: ${Date.now() - t3}ms (未命中, 走完整路径)`);
+    console.log(`[OCR] 快速路径未命中原因: detected chars与prompt不完全匹配或置信度<${FAST_PATH_CONF_THRESHOLD}`);
+    for (const d of detected) {
+      console.log(`[OCR]   detected="${d.char}" onnxConf=${d.onnxConfidence?.toFixed(3)} inPrompt=${promptText.includes(d.char)}`);
     }
 
     // Step 4: 完整路径 — 计算 HOG 特征
@@ -334,9 +356,12 @@ export class LocalOCREngine {
     // Step 1: ONNX ddddocr 检测模型
     if (this._onnxReady) {
       try {
-        const detections = await this.onnxDetector.detect(imgBuffer);
+        const tOnnx = Date.now();
+        const detections = await this.onnxDetector.detect(imgBuffer, imgW, imgH);
+        console.log(`[OCR-耗时] ONNX detect: ${Date.now() - tOnnx}ms, 原始检测数=${detections ? detections.length : 0}`);
         if (detections && detections.length >= 3) {
-          const maxKeep = promptText ? Math.max(promptText.length + 2, 5) : 10;
+          // 优化：只保留 promptText.length + 1 个区域（减少 OCR 调用数）
+          const maxKeep = promptText ? Math.max(promptText.length + 1, 4) : 8;
           const topDetections = detections
             .sort((a, b) => b.confidence - a.confidence)
             .slice(0, maxKeep);
@@ -356,7 +381,9 @@ export class LocalOCREngine {
 
     // Step 2: 连通区域检测
     try {
+      const tCc = Date.now();
       const boxes = await this._detectByConnectedComponents(imgBuffer, imgW, imgH);
+      console.log(`[OCR-耗时] 连通区域检测: ${Date.now() - tCc}ms`);
       if (boxes && boxes.length >= 3) {
         console.log(`[OCR] 连通区域检测: ${boxes.length} 个区域`);
         return boxes;
@@ -369,9 +396,11 @@ export class LocalOCREngine {
 
     // Step 3: tesseract PSM=6
     try {
+      const tTess6 = Date.now();
       const result = await Tesseract.recognize(imgBuffer, 'chi_sim', {
         tessedit_pageseg_mode: '6',
       });
+      console.log(`[OCR-耗时] tesseract PSM=6: ${Date.now() - tTess6}ms`);
       const words = result.data.words;
       if (!words || words.length === 0) return null;
       const regions = words
@@ -385,9 +414,11 @@ export class LocalOCREngine {
 
     // Step 4: PSM=12
     try {
+      const tTess12 = Date.now();
       const result = await Tesseract.recognize(imgBuffer, 'chi_sim', {
         tessedit_pageseg_mode: '12',
       });
+      console.log(`[OCR-耗时] tesseract PSM=12: ${Date.now() - tTess12}ms`);
       const words = result.data.words;
       if (!words || words.length === 0) return null;
       return words
@@ -534,7 +565,7 @@ export class LocalOCREngine {
 
   // ── 图片裁剪 ────────────────────────────────────
 
-  private async _cropRegion(imgBuffer: Buffer, box: [number, number, number, number], imgW: number = 9999, imgH: number = 9999): Promise<Buffer> {
+  private async _cropRegion(imgBuffer: Buffer, box: [number, number, number, number], imgW: number = 9999, imgH: number = 9999): Promise<CropResult> {
     const clampedBox: [number, number, number, number] = [
       Math.max(0, Math.min(box[0], imgW)),
       Math.max(0, Math.min(box[1], imgH)),
@@ -549,22 +580,25 @@ export class LocalOCREngine {
     const width = Math.max(1, Math.min(x2 + pad, imgW) - left);
     const height = Math.max(1, Math.min(y2 + pad, imgH) - top);
 
-    return sharp(imgBuffer)
+    const buffer = await sharp(imgBuffer)
       .extract({ left, top, width, height })
       .toBuffer();
+
+    return { buffer, width, height };
   }
 
   // ── OCR 集成 ────────────────────────────────────
 
   /**
    * OCR 分类：ONNX 分类优先（含 softmax 置信度 + top-k 候选）
+   * 优化：接受已知裁剪尺寸，避免 OCR classifier 内部 metadata 调用
    */
-  private async _ocrEnsemble(cropBuffer: Buffer): Promise<OCREnsembleResult> {
+  private async _ocrEnsemble(cropBuffer: Buffer, cropW?: number, cropH?: number): Promise<OCREnsembleResult> {
     // ONNX OCR 分类（含置信度 + top-k）
     if (this._onnxOcrReady) {
       try {
         const tOcr = Date.now();
-        const { text, confidence, topKChars } = await this.onnxClassifier.classifyWithConfidence(cropBuffer);
+        const { text, confidence, topKChars } = await this.onnxClassifier.classifyWithConfidence(cropBuffer, cropW, cropH);
         console.log(`[OCR-耗时] ONNX classifyWithConfidence: ${Date.now() - tOcr}ms`);
         // 合并 top-1 + top-k 候选为 allResults
         const allResults = new Set<string>();
@@ -628,6 +662,7 @@ export class LocalOCREngine {
   // ── HOG 特征提取 ────────────────────────────────
 
   private async _extractHOGFeature(cropBuffer: Buffer): Promise<number[]> {
+
     const resized = await sharp(cropBuffer)
       .resize(FEAT_SIZE, FEAT_SIZE, { fit: 'fill' })
       .grayscale()
